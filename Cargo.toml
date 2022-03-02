@@ -1,0 +1,21 @@
+[package]
+name = "p2p"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "3.0", default-features = false, features = ["std"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+log = { version = "0.4", default-features = false, features = ["std"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+simple_logger = { version = "1.16", default-features = false, features = ["colors"] }
+tokio = { version = "1.15", default-features = false, features = ["io-util", "fs", "signal", "sync", "rt", "rt-multi-thread", "net", "time"] }
+tokio-serde = { version = "0.8", default-features = false, features = ["json"] }
+tokio-util = { version = "0.6", default-features = false, features = ["codec"] }
+uuid = { version = "0.8", default-features = false, features = ["v4", "serde"] }
+rustydht-lib = { path = "../../RustPart2/rustydht-lib" }
+tower = { version = "0.4.12" }
+sha-1 = "0.10.0"
+portpicker = "0.1.1"
