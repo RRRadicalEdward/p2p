@@ -1,35 +1,26 @@
 use crate::{file_manager::FileManager, proto::Proto};
 use anyhow::anyhow;
-use futures::{future::FutureExt, TryFutureExt, TryStreamExt};
+use futures::{future::FutureExt, TryFutureExt};
 use log::debug;
-use sha1::digest::Output;
 use std::{
-    fs::read,
     future::Future,
-    io,
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
+use std::error::Error;
 use tokio::{
-    io::{AsyncReadExt, Interest, ReadBuf, Ready},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf},
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpStream,
     },
     pin,
     sync::{Mutex, Notify},
 };
-use tower::Service;
-//use tokio_serde::{formats::SymmetricalJson, SymmetricallyFramed};
-//use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
-
-//type FramedReaderT = SymmetricallyFramed<FramedRead<OwnedReadHalf, LengthDelimitedCodec>, (), SymmetricalJson<()>>;
-//type FrameWriterT = SymmetricallyFramed<FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>, (), SymmetricalJson<()>>;
 
 pub struct Session {
-    peer_addr: SocketAddr,
     file_manager: Arc<FileManager>,
     // _writer: Arc<Mutex<FrameWriterT>>,
     //  reader: FramedReaderT,
@@ -38,49 +29,19 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(connection: TcpStream, graceful_shutdown_notifier: Arc<Notify>, file_manager: Arc<FileManager>) -> Self {
-        let peer_addr = connection
-            .peer_addr()
-            .expect("I would be wondered if getting peer addr can fail 🙂");
-        /*
-        let (read, write) = connection.into_split();
+    pub fn new(graceful_shutdown_notifier: Arc<Notify>, file_manager: Arc<FileManager>) -> Self {
+        let should_stop = Arc::new(Mutex::new(false));
 
-        let reader = tokio_serde::SymmetricallyFramed::new(
-            FramedRead::new(read, LengthDelimitedCodec::new()),
-            SymmetricalJson::<()>::default(),
-        );
-
-        let writer = tokio_serde::SymmetricallyFramed::new(
-            FramedWrite::new(write, LengthDelimitedCodec::new()),
-            SymmetricalJson::<()>::default(),
-        );
-        */
-        Self {
-            peer_addr,
-            file_manager,
-            //   reader,
-            //   _writer: Arc::new(Mutex::new(writer)),
-            graceful_shutdown_notifier,
-            should_stop: Arc::new(Mutex::new(false)),
-        }
-    }
-
-    pub async fn serve(&mut self) {
-        let graceful_shutdown_notifier_task = tokio::spawn(setup_graceful_shutdown_notifier_task(
-            Arc::clone(&self.graceful_shutdown_notifier),
-            Arc::clone(&self.should_stop),
+        tokio::spawn(setup_graceful_shutdown_notifier_task(
+            Arc::clone(&graceful_shutdown_notifier),
+            Arc::clone(&should_stop),
         ));
 
-        /*
-        while !*self.should_stop.lock().await {
-            if let Some(message) = self.reader.try_next().await.unwrap() {
-                debug!("got {message:?} message from {} node", self.peer_addr);
-            }
+        Self {
+            file_manager,
+            graceful_shutdown_notifier,
+            should_stop,
         }
-        */
-
-        debug!("finishing session with {} node", self.peer_addr);
-        graceful_shutdown_notifier_task.abort(); // peer disconnected so we do not need to wait anymore for the graceful shutdown notifier signal
     }
 }
 
@@ -105,39 +66,47 @@ impl tower::Service<Proto> for Session {
         }
     }
 
-    fn call(&mut self, req: Proto) -> Self::Future {
-        //match req {}
-
+    fn call(&mut self, req: Proto) -> Self::Future
+    {
         Box::pin(async { Ok(Proto::Init) })
     }
 }
 
-struct ReadLayer {
+pub struct ReadLayer {
     reader: Arc<Mutex<OwnedReadHalf>>,
 }
 
+impl ReadLayer {
+    pub fn new(reader: OwnedReadHalf) -> Self {
+        Self {
+            reader: Arc::new(Mutex::new(reader))
+        }
+    }
+}
+
 impl<S> tower::Layer<S> for ReadLayer
-where
-    S: tower::Service<Vec<u8>>,
+    where
+        S: tower::Service<Proto>,
 {
     type Service = ReadService<S>;
 
     fn layer(&self, service: S) -> Self::Service {
         ReadService {
-            service,
+            service: Arc::new(Mutex::new(service)),
             reader: Arc::clone(&self.reader),
         }
     }
 }
 
-struct ReadService<S: tower::Service<Vec<u8>>> {
-    service: S,
+pub struct ReadService<S: tower::Service<Proto>> {
+    service: Arc<Mutex<S>>,
     reader: Arc<Mutex<OwnedReadHalf>>,
 }
 
 impl<S> tower::Service<()> for ReadService<S>
-where
-    S: tower::Service<Vec<u8>>,
+    where
+        S: tower::Service<Proto> + 'static,
+        <S>::Error: Send + Sync + Error,
 {
     type Response = ();
     type Error = anyhow::Error;
@@ -147,37 +116,64 @@ where
         let future = self
             .reader
             .lock()
-            .then(|reader| async move { reader.ready(Interest::READABLE).await });
+            .then(|reader| async move { reader.readable().await });
 
         pin!(future);
 
-        match future.poll(cx) {
-            Poll::Ready(Ok(ready)) => {
-                if ready.is_readable() {
-                    Poll::Ready(Ok(()))
-                } else {
-                    Poll::Pending
-                }
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e.into())),
-            Poll::Pending => Poll::Pending,
-        }
+        future.poll(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, req: ()) -> Self::Future {
+    fn call(&mut self, _: ()) -> Self::Future
+    {
+        let reader = self.reader.clone();
+        let service = self.service.clone();
+
         let mut buf = Vec::with_capacity(512);
-        let future = self
-            .reader
-            .lock()
-            .then(|mut reader| async { reader.read(&mut buf).await.map(|_| ()).map_err(|err| err.into()) })
-            .map_ok(|_| self.service.call(buf));
+        let future =
+            reader
+                .lock_owned()
+                .then(|mut reader| async move { reader.read(&mut buf).await.map(|_| (buf)).map_err(Into::into) })
+                .and_then(|buf| async move {
+                    let mut service = service.lock_owned().await;
+                    let proto = serde_json::from_slice::<Proto>(&buf)?;
+                    service.call(proto).await.map(|_| ()).map_err(Into::into)
+                });
 
-        pin!(future);
-
-        future
+        Box::pin(future)
     }
 }
 
-struct WriteLayer {
-    write: OwnedWriteHalf,
+pub struct WriteService
+{
+    writer: Arc<Mutex<OwnedWriteHalf>>,
 }
+
+impl tower::Service<Proto> for WriteService
+{
+    type Response = ();
+    type Error = anyhow::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let future = self
+            .writer
+            .lock()
+            .then(|reader| async move { reader.writable().await });
+
+        pin!(future);
+
+        future.poll(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, req: Proto) -> Self::Future
+    {
+        let writer = Arc::clone(&self.writer);
+        let future = writer.lock_owned().then(|mut writer| async move {
+            let bytes = serde_json::to_vec(&req).map_err(anyhow::Error::new)?;
+            writer.write_all(&bytes).await.map_err(Into::into)
+        });
+
+        Box::pin(future)
+    }
+}
+

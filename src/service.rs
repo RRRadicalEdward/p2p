@@ -16,6 +16,8 @@ use tokio::{
     runtime::{Builder as RuntimeBuilder, Runtime},
     sync::{Mutex, Notify},
 };
+use tower::{Layer, Service};
+use crate::session::ReadLayer;
 
 type FileManagersT = Arc<Mutex<HashSet<Arc<FileManager>>>>;
 
@@ -240,8 +242,15 @@ fn start_sessions_with_get_peers_nodes(
                 .await
                 .context(format!("failed connect to {node}"))
                 .unwrap();
-            let mut session = Session::new(connection, graceful_shutdown_notifier, file_manager);
-            session.serve().await;
+            let (reader, writer) = connection.into_split();
+
+            let mut session = Session::new(graceful_shutdown_notifier, file_manager);
+            let read_layer = ReadLayer::new(reader);
+            let mut read_service = read_layer.layer(session);
+
+            tokio::spawn(async move {
+                    read_service.call(()).await
+                });
         });
     }
 }
