@@ -1,5 +1,4 @@
 use anyhow::Context;
-use log::{debug, trace};
 use rustydht_lib::{
     common::{ipv4_addr_src::IPV4Consensus, Id, Node},
     dht::{
@@ -14,6 +13,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::mpsc::Receiver;
+use tracing::{debug, trace};
 
 pub struct DhtNode {
     dht: DHT,
@@ -22,12 +22,14 @@ pub struct DhtNode {
 }
 
 impl DhtNode {
+    #[tracing::instrument(fields(port, addr), err)]
     pub fn new(timeout_duration: Duration) -> anyhow::Result<Self> {
         let (sender, receiver) = create_shutdown();
 
         let port = portpicker::pick_unused_port().expect("no free port in the system :(");
+        let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
         let dht = DHTBuilder::new()
-            .listen_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
+            .listen_addr(addr)
             .settings(
                 DHTSettingsBuilder::new()
                     .read_only(false)
@@ -50,29 +52,32 @@ impl DhtNode {
         self.dht.run_event_loop().await.map_err(|err| err.into())
     }
 
-    pub async fn announce_peer<H: AsRef<[u8]>>(&self, info_hash: H, port: u16) -> anyhow::Result<Vec<Node>> {
-        debug!("announce infohash: {:02x?}", info_hash.as_ref());
-        let id = Id::from_bytes(info_hash.as_ref())?;
+    #[tracing::instrument(skip(self))]
+    pub async fn announce_peer(&self, info_hash: &[u8], port: u16) -> anyhow::Result<Vec<Node>> {
+        debug!("announce infohash: {info_hash:02x?}",);
+        let id = Id::from_bytes(info_hash)?;
         announce_peer(&self.dht, id, Some(port), self.timeout_duration)
             .await
-            .with_context(|| format!("announce peer failed for infohash {:02x?}", info_hash.as_ref()))
+            .with_context(|| format!("announce peer failed for infohash {info_hash:02x?}"))
     }
 
-    pub async fn find_nodes<H: AsRef<[u8]>>(&self, info_hash: H) -> anyhow::Result<Vec<Node>> {
-        debug!("find nodes for infohash {:02x?}", info_hash.as_ref());
-        let id = Id::from_bytes(info_hash.as_ref())?;
+    #[tracing::instrument(skip(self))]
+    pub async fn find_nodes(&self, info_hash: &[u8]) -> anyhow::Result<Vec<Node>> {
+        debug!("find nodes for infohash {info_hash:02x?}");
+        let id = Id::from_bytes(info_hash)?;
         find_node(&self.dht, id, self.timeout_duration)
             .await
-            .with_context(|| format!("find nodes failed for infohash {:02x?}", info_hash.as_ref()))
+            .with_context(|| format!("find nodes failed for infohash {info_hash:02x?}"))
     }
 
-    pub async fn get_peers<H: AsRef<[u8]>>(&self, info_hash: H) -> anyhow::Result<GetPeersResult> {
-        debug!("get peers for infohash {:02x?}", info_hash.as_ref());
-        let id = Id::from_bytes(info_hash.as_ref())?;
+    #[tracing::instrument(skip(self))]
+    pub async fn get_peers(&self, info_hash: &[u8]) -> anyhow::Result<GetPeersResult> {
+        debug!("get peers for infohash {info_hash:02x?}");
+        let id = Id::from_bytes(info_hash)?;
 
         get_peers(&self.dht, id, self.timeout_duration)
             .await
-            .with_context(|| format!("get peers failed for infohash {:02x?}", info_hash.as_ref()))
+            .with_context(|| format!("get peers failed for infohash {info_hash:02x?}"))
     }
 
     pub async fn stop(&mut self) {

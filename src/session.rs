@@ -1,179 +1,194 @@
-use crate::{file_manager::FileManager, proto::Proto};
-use anyhow::anyhow;
-use futures::{future::FutureExt, TryFutureExt};
-use log::debug;
-use std::{
-    future::Future,
-    net::SocketAddr,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
+use crate::{
+    file_manager::FileManager,
+    memmap::MemMap,
+    proto::{Proto, ProtoReader, ProtoWriter},
+    shutdown::ShutdownNotifier,
 };
-use std::error::Error;
+use anyhow::Context;
+use std::sync::Arc;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpStream,
     },
-    pin,
-    sync::{Mutex, Notify},
 };
+use tracing::{debug, error, info};
 
-pub struct Session {
-    file_manager: Arc<FileManager>,
-    // _writer: Arc<Mutex<FrameWriterT>>,
-    //  reader: FramedReaderT,
-    graceful_shutdown_notifier: Arc<Notify>,
-    should_stop: Arc<Mutex<bool>>,
+pub struct Session<RWS, W, R>
+where
+    RWS: AsyncWrite + AsyncRead + AsyncSeek + Unpin,
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    file_manager: Arc<FileManager<RWS>>,
+    writer: ProtoWriter<W>,
+    reader: ProtoReader<R>,
+    shutdown_notifier: ShutdownNotifier,
 }
 
-impl Session {
-    pub fn new(graceful_shutdown_notifier: Arc<Notify>, file_manager: Arc<FileManager>) -> Self {
-        let should_stop = Arc::new(Mutex::new(false));
-
-        tokio::spawn(setup_graceful_shutdown_notifier_task(
-            Arc::clone(&graceful_shutdown_notifier),
-            Arc::clone(&should_stop),
-        ));
+impl Session<MemMap, OwnedWriteHalf, OwnedReadHalf> {
+    pub fn new(
+        connection: TcpStream,
+        shutdown_notifier: ShutdownNotifier,
+        file_manager: Arc<FileManager<MemMap>>,
+    ) -> Self {
+        let (reader, writer) = connection.into_split();
 
         Self {
             file_manager,
-            graceful_shutdown_notifier,
-            should_stop,
+            reader: ProtoReader::new(reader),
+            writer: ProtoWriter::new(writer),
+            shutdown_notifier,
         }
     }
 }
 
-async fn setup_graceful_shutdown_notifier_task(graceful_shutdown_notifier: Arc<Notify>, should_stop: Arc<Mutex<bool>>) {
-    graceful_shutdown_notifier.notified().await;
-    {
-        let mut should_stop = should_stop.lock().await;
-        *should_stop = true;
+impl<RWS, W, R> Session<RWS, W, R>
+where
+    RWS: AsyncRead + AsyncWrite + AsyncSeek + Unpin,
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    #[tracing::instrument(skip(self), err, fields(filename = self.file_manager.manifest().filename(), file_infohash = format!("{:02x?}", self.file_manager.manifest().infohash()).as_str()))]
+    pub async fn serve_sharing(mut self) -> anyhow::Result<()> {
+        while !self.shutdown_notifier.should_stop().await {
+            let message = self.read_message().await?;
+
+            debug!("got {message:?} message");
+
+            match message {
+                Proto::Request(index) => {
+                    let data = match self.file_manager.filled_chunk(index).await {
+                        Ok(data) => data,
+                        Err(err) => {
+                            let _ = self
+                                .writer
+                                .write(Proto::Error(format!(
+                                    "error occurred while trying to get a chunk undex {index} index: {err}"
+                                )))
+                                .await
+                                .map_err(|err| error!("sending an error message failed: {err}"));
+
+                            break;
+                        }
+                    };
+
+                    match self.writer.write(Proto::Data(data)).await {
+                        Ok(()) => {}
+                        Err(err) => {
+                            error!("failed to send a chunk of data undex {index} index: {err}");
+                            break;
+                        }
+                    }
+                }
+                Proto::Fin => {
+                    debug!("closing sharing {}", self.file_manager.manifest().filename());
+                    break;
+                }
+                Proto::Error(err) => {
+                    error!("peer sent an error message: {err}. closing sharing.");
+                }
+                _ => {
+                    error!("a peer send an incorrect message. closing connection.");
+                    self.writer
+                        .write(Proto::Error(format!("unexpected message {message:?}")))
+                        .await?;
+
+                    break;
+                }
+            }
+        }
+
+        self.writer.write(Proto::Fin).await?;
+        self.writer.into_inner().shutdown().await?;
+
+        Ok(())
     }
-}
 
-impl tower::Service<Proto> for Session {
-    type Response = Proto;
-    type Error = anyhow::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
+    #[tracing::instrument(skip(self), err)]
+    pub async fn serve_downloading(mut self) -> anyhow::Result<()> {
+        self.writer
+            .write(Proto::Init(self.file_manager.manifest().infohash().to_owned()))
+            .await
+            .context("failed to send Init proto message")?;
 
-    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if *self.should_stop.blocking_lock() {
-            Poll::Ready(Err(anyhow!("session stopped")))
-        } else {
-            Poll::Ready(Ok(()))
+        while !self.shutdown_notifier.should_stop().await {
+            let message = self.read_message().await?;
+
+            match message {
+                Proto::Data(data) => {
+                    if let Some(data) = data {
+                        match self.file_manager.fill_chunk(data).await {
+                            Ok(()) => {}
+                            Err(err) => {
+                                error!("an error happened when trying to fill a chunk of data: {err}");
+                                self.send_error_with_fin_message(format!(
+                                    "an error happened when trying to fill a chunk of data: {err}"
+                                ))
+                                .await?;
+                            }
+                        }
+                    }
+
+                    match self.file_manager.absent_chunk_index().await {
+                        Some(index) => {
+                            self.writer.write(Proto::Request(index)).await?;
+                        }
+                        None => {
+                            info!("the file should be done");
+                            break;
+                        }
+                    }
+                }
+                Proto::Fin => {
+                    let manifest = self.file_manager.manifest();
+                    debug!(
+                        "closing downloading {}({:02x?})",
+                        manifest.filename(),
+                        manifest.infohash(),
+                    );
+                    break;
+                }
+                Proto::Error(err) => {
+                    error!("peer sent an error message: {err}. closing sharing.");
+                }
+                _ => {
+                    error!("a peer send an incorrect message. closing connection.");
+                    self.writer
+                        .write(Proto::Error(format!("unexpected message {message:?}")))
+                        .await?;
+                    break;
+                }
+            }
+        }
+
+        self.writer.write(Proto::Fin).await?;
+        self.writer.into_inner().shutdown().await?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip_all, ret, err)]
+    async fn read_message(&mut self) -> anyhow::Result<Proto> {
+        match self.reader.read().await {
+            Ok(message) => Ok(message),
+            Err(err) => {
+                self.send_error_with_fin_message(format!("failed to deserialize a message: {err}"))
+                    .await?;
+
+                Err(err)
+            }
         }
     }
 
-    fn call(&mut self, req: Proto) -> Self::Future
-    {
-        Box::pin(async { Ok(Proto::Init) })
-    }
-}
-
-pub struct ReadLayer {
-    reader: Arc<Mutex<OwnedReadHalf>>,
-}
-
-impl ReadLayer {
-    pub fn new(reader: OwnedReadHalf) -> Self {
-        Self {
-            reader: Arc::new(Mutex::new(reader))
-        }
-    }
-}
-
-impl<S> tower::Layer<S> for ReadLayer
-    where
-        S: tower::Service<Proto>,
-{
-    type Service = ReadService<S>;
-
-    fn layer(&self, service: S) -> Self::Service {
-        ReadService {
-            service: Arc::new(Mutex::new(service)),
-            reader: Arc::clone(&self.reader),
-        }
-    }
-}
-
-pub struct ReadService<S: tower::Service<Proto>> {
-    service: Arc<Mutex<S>>,
-    reader: Arc<Mutex<OwnedReadHalf>>,
-}
-
-impl<S> tower::Service<()> for ReadService<S>
-    where
-        S: tower::Service<Proto> + 'static,
-        <S>::Error: Send + Sync + Error,
-{
-    type Response = ();
-    type Error = anyhow::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let future = self
-            .reader
-            .lock()
-            .then(|reader| async move { reader.readable().await });
-
-        pin!(future);
-
-        future.poll(cx).map_err(Into::into)
-    }
-
-    fn call(&mut self, _: ()) -> Self::Future
-    {
-        let reader = self.reader.clone();
-        let service = self.service.clone();
-
-        let mut buf = Vec::with_capacity(512);
-        let future =
-            reader
-                .lock_owned()
-                .then(|mut reader| async move { reader.read(&mut buf).await.map(|_| (buf)).map_err(Into::into) })
-                .and_then(|buf| async move {
-                    let mut service = service.lock_owned().await;
-                    let proto = serde_json::from_slice::<Proto>(&buf)?;
-                    service.call(proto).await.map(|_| ()).map_err(Into::into)
-                });
-
-        Box::pin(future)
-    }
-}
-
-pub struct WriteService
-{
-    writer: Arc<Mutex<OwnedWriteHalf>>,
-}
-
-impl tower::Service<Proto> for WriteService
-{
-    type Response = ();
-    type Error = anyhow::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let future = self
+    #[tracing::instrument(skip_all, err)]
+    async fn send_error_with_fin_message(&mut self, error_message: String) -> anyhow::Result<()> {
+        let _ = self
             .writer
-            .lock()
-            .then(|reader| async move { reader.writable().await });
+            .write(Proto::Error(error_message))
+            .await
+            .map_err(|err| error!("sending an error message failed: {err}"));
 
-        pin!(future);
-
-        future.poll(cx).map_err(Into::into)
-    }
-
-    fn call(&mut self, req: Proto) -> Self::Future
-    {
-        let writer = Arc::clone(&self.writer);
-        let future = writer.lock_owned().then(|mut writer| async move {
-            let bytes = serde_json::to_vec(&req).map_err(anyhow::Error::new)?;
-            writer.write_all(&bytes).await.map_err(Into::into)
-        });
-
-        Box::pin(future)
+        self.writer.write(Proto::Fin).await
     }
 }
-

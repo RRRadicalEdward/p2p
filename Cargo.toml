@@ -4,18 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1"
-clap = { version = "3.0", default-features = false, features = ["std"] }
-futures = { version = "0.3", default-features = false, features = ["std"] }
-log = { version = "0.4", default-features = false, features = ["std"] }
-serde = { version = "1", default-features = false, features = ["derive"] }
-serde_json = { version = "1", default-features = false, features = ["std"] }
-simple_logger = { version = "1.16", default-features = false, features = ["colors"] }
-tokio = { version = "1.15", default-features = false, features = ["io-util", "fs", "signal", "sync", "rt", "rt-multi-thread", "net", "time"] }
-tokio-serde = { version = "0.8", default-features = false, features = ["json"] }
-tokio-util = { version = "0.6", default-features = false, features = ["codec"] }
-uuid = { version = "0.8", default-features = false, features = ["v4", "serde"] }
-rustydht-lib = { path = "../../RustPart2/rustydht-lib" }
-tower = { version = "0.4.12" }
-sha-1 = "0.10.0"
+anyhow = "1.0.56"
+chrono = "0.4.19"
+clap = { version = "3.1.6", default-features = false, features = ["std", "derive", "color"] }
+color-eyre = { version = "0.6.1", default-features = false }
+futures = { version = "0.3.21", default-features = false, features = ["std"] }
 portpicker = "0.1.1"
+rand = "0.8.5"
+memmap2 = "0.5.3"
+rustydht-lib = { path = "../../RustPart2/rustydht-lib" }
+serde = { version = "1.0.136", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0.79", default-features = false, features = ["std"] }
+sha-1 = "0.10.0"
+tokio = { version = "1.17.0", default-features = false, features = ["io-util", "io-std", "fs", "signal", "sync", "rt", "rt-multi-thread", "net", "time", "parking_lot", "test-util"] }
+tokio-serde = { version = "0.8.0", default-features = false, features = ["json"] }
+tokio-util = { version = "0.7.0", default-features = false, features = ["codec", "futures-io"] }
+tracing = { version = "0.1.31", default-features = false, features = ["default", "log"] }
+tracing-subscriber = { version = "0.3.9", features = ["env-filter"] }

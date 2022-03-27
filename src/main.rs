@@ -1,25 +1,15 @@
 use anyhow::Context;
-use log::error;
-use p2p::{config::Config, service::NodeService};
-use simple_logger::SimpleLogger;
-use std::panic;
+use clap::Parser;
+use p2p::{config::Config, log::setup_logger, service::NodeService};
 use tokio::runtime::Builder as RuntimeBuilder;
 
+#[tracing::instrument(ret)]
 fn main() -> anyhow::Result<()> {
-    SimpleLogger::new()
-        .env()
-        .init()
-        .with_context(|| "logger initialization failed")?;
+    color_eyre::install().unwrap();
 
-    panic::set_hook(Box::new(|panic_info| {
-        error!(
-            "{:?}:{}",
-            panic_info.location(),
-            panic_info.payload().downcast_ref::<String>().unwrap_or(&String::new()),
-        );
-    }));
+    setup_logger();
 
-    let config = Config::new();
+    let config = Config::parse();
 
     let mut node_service = NodeService::new(config);
     node_service.start();
@@ -50,6 +40,5 @@ async fn build_signals_fut() -> anyhow::Result<()> {
         tokio::signal::ctrl_c().await.context("CTRL_C signal failed")?;
     }
 
-    println!("ctl + C");
     Ok(())
 }
